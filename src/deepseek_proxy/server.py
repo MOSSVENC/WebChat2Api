@@ -182,6 +182,7 @@ def create_app(config: ProxyConfig) -> FastAPI:
         response_format = body.get("response_format")
         web_search = body.get("web_search")
         reasoning_effort = body.get("reasoning_effort")
+        jailbreak = body.get("jailbreak")
 
         if not messages:
             raise HTTPException(status_code=400, detail="messages is required")
@@ -196,6 +197,7 @@ def create_app(config: ProxyConfig) -> FastAPI:
                 response_format=response_format,
                 web_search=web_search,
                 reasoning_effort=reasoning_effort,
+                jailbreak=jailbreak,
             )
         except Exception as e:
             import logging

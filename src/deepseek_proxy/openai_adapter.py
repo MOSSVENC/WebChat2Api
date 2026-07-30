@@ -12,6 +12,7 @@ from .config import ProxyConfig, DeepSeekModel
 from .client import DsClient
 from .prompt import build_chatml_prompt
 from .sessions import SessionStrategy
+from .jailbreak import get_jailbreak_prompt
 
 
 class OpenAIAdapter:
@@ -53,11 +54,21 @@ class OpenAIAdapter:
         response_format: Optional[dict] = None,
         web_search: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
+        jailbreak: Optional[str] = None,
     ) -> str:
-        """构建 ChatML prompt"""
+        """构建 ChatML prompt
 
-        # 如果 request 中显式指定了搜索/推理, 但不改变 prompt 内容 (仅影响 adapter 参数)
-        # prompt 构建只用 messages + tools + response_format
+        如果指定了 jailbreak 模板，会在 messages 最前面注入
+        一条 system message 作为破限指令。
+        """
+        jailbreak_prompt = get_jailbreak_prompt(jailbreak)
+        if jailbreak_prompt:
+            # 注入破限 system message 到最前面
+            messages = [
+                {"role": "system", "content": jailbreak_prompt},
+                *messages,
+            ]
+
         return build_chatml_prompt(
             messages=messages,
             tools=tools,
@@ -75,9 +86,13 @@ class OpenAIAdapter:
         response_format: Optional[dict] = None,
         web_search: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
+        jailbreak: Optional[str] = None,
     ):
         """
         执行一次对话请求。
+
+        Args:
+            jailbreak: 破限模板名称，None 或不传则不启用
 
         Returns:
             如果是 stream=True: httpx 流式响应 (可通过 full_sse_pipeline 解析)
@@ -94,7 +109,7 @@ class OpenAIAdapter:
         if web_search:
             search_enabled = True
 
-        # 构建 prompt
+        # 构建 prompt（含可选的破限注入）
         prompt = self.build_prompt(
             messages=messages,
             model=model,
@@ -103,6 +118,7 @@ class OpenAIAdapter:
             response_format=response_format,
             web_search=web_search,
             reasoning_effort=reasoning_effort,
+            jailbreak=jailbreak,
         )
 
         # 执行
