@@ -104,10 +104,10 @@ class OpenAIAdapter:
         thinking_enabled = default_thinking
         search_enabled = default_search
 
-        if reasoning_effort:
+        if reasoning_effort is not None:
             thinking_enabled = True
-        if web_search:
-            search_enabled = True
+        if web_search is not None:
+            search_enabled = bool(web_search)
 
         # 构建 prompt（含可选的破限注入）
         prompt = self.build_prompt(

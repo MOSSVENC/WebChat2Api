@@ -162,8 +162,19 @@ def _format_function_call(fc: dict) -> str:
 # 工具定义格式化
 # ═══════════════════════════════════════════════════════════
 
-def _format_tools(tools: list[dict], tool_choice: Any = None) -> str:
-    """格式化工具定义 + 使用规范"""
+def _format_tools(tools: list[dict], tool_choice: Any = None) -> Optional[str]:
+    """格式化工具定义 + 使用规范
+
+    支持 OpenAI tool_choice 标准格式：
+    - "auto"（默认）: 模型自行决定
+    - "none": 不使用工具
+    - "required": 必须调用工具
+    - {"type": "function", "function": {"name": "xxx"}}: 强制使用指定函数
+    """
+    # tool_choice = "none" 时跳过工具定义
+    if tool_choice == "none":
+        return None
+
     lines = ["# Tools", ""]
 
     for i, tool in enumerate(tools):
@@ -172,9 +183,9 @@ def _format_tools(tools: list[dict], tool_choice: Any = None) -> str:
         desc = func.get("description", "")
         params = func.get("parameters", {})
 
-        lines.append(f"You may call one or more functions to assist with user query.")
+        lines.append("You may call one or more functions to assist with user query.")
         lines.append("You may use the following functions:")
-        lines.append(f"```json")
+        lines.append("```json")
         lines.append(json.dumps({name: {
             "description": desc,
             "parameters": params,
@@ -188,10 +199,27 @@ def _format_tools(tools: list[dict], tool_choice: Any = None) -> str:
     lines.append('[{"name": "function_name", "arguments": {"arg1": "value1", ...}}]')
     lines.append("</tool_calls>")
     lines.append("```")
+    lines.append("")
+    lines.append("IMPORTANT: Output the tool call inside <tool_calls> tags exactly as shown above.")
+    lines.append("The arguments must be a valid JSON object, not a string.")
 
-    if tool_choice == "required":
+    # 处理 tool_choice
+    if isinstance(tool_choice, dict):
+        # {"type": "function", "function": {"name": "xxx"}}
+        forced_name = (
+            tool_choice.get("function", {}).get("name")
+            or tool_choice.get("function", {}).get("name", "")
+        )
+        if forced_name:
+            lines.append("")
+            lines.append(f"You MUST call the function `{forced_name}` to complete this request.")
+            lines.append("Do not call any other function.")
+    elif tool_choice == "required":
         lines.append("")
-        lines.append("注意：你必须调用至少一个工具函数来完成用户的请求。")
+        lines.append("You MUST call at least one function to complete the user's request.")
+    elif tool_choice == "auto":
+        lines.append("")
+        lines.append("You MAY call a function if it helps, but it's optional.")
 
     return "\n".join(lines)
 
