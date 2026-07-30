@@ -113,8 +113,14 @@ def _format_content(content) -> str:
                 if part.get("type") == "text":
                     texts.append(part.get("text", ""))
                 elif part.get("type") == "image_url":
-                    detail = part.get("image_url", {}).get("detail", "auto")
-                    texts.append(f"[图片: detail={detail}]")
+                    image_url = part.get("image_url", {})
+                    url = image_url.get("url", "")
+                    detail = image_url.get("detail", "auto")
+                    if url:
+                        # 直接嵌入图片 URL（支持 base64 data URL 或 HTTP URL）
+                        texts.append(f"\n![image]({url})\n")
+                    else:
+                        texts.append(f"[图片: detail={detail}]")
                 elif part.get("type") == "input_audio":
                     fmt = part.get("input_audio", {}).get("format", "unknown")
                     texts.append(f"[音频: format={fmt}]")
