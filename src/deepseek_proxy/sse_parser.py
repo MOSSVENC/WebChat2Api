@@ -10,16 +10,23 @@ SSE 流解析 Pipeline — 三层转换: Byte → SSE Event → DsFrame → Open
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, AsyncIterator, Any, Callable
+from typing import Optional, AsyncIterator, Any
 
 
 # ═══════════════════════════════════════════════════════════
 # Layer 1: SSE Event
 # ═══════════════════════════════════════════════════════════
+
+MAX_BUF_SIZE = 4 * 1024 * 1024  # 4 MB，防止 OOM
+
+# 预编译正则：移除搜索关键词前缀
+_RE_SEARCH_PREFIX = re.compile(r'^(SEARCH|WEB_SEARCH|SEARCHING)\s*', re.IGNORECASE)
+
 
 @dataclass
 class SseEvent:
@@ -33,22 +40,27 @@ async def parse_sse_stream(byte_stream) -> AsyncIterator[SseEvent]:
 
     以 \\n\\n 为事件分隔符，解析 event: 和 data: 字段。
     """
-    buf = b""
+    buf = bytearray()
 
     async for chunk in byte_stream:
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8")
-        buf += chunk
+        buf.extend(chunk)
+
+        if len(buf) > MAX_BUF_SIZE:
+            raise RuntimeError(f"SSE buffer overflow: {len(buf)} bytes > {MAX_BUF_SIZE}")
 
         while b"\n\n" in buf:
-            raw_event, buf = buf.split(b"\n\n", 1)
+            idx = buf.index(b"\n\n")
+            raw_event = bytes(buf[:idx])
+            del buf[:idx + 2]
             evt = _parse_raw_event(raw_event.decode("utf-8", errors="replace"))
             if evt:
                 yield evt
 
     # 末尾残留
     if buf.strip():
-        evt = _parse_raw_event(buf.decode("utf-8", errors="replace"))
+        evt = _parse_raw_event(bytes(buf).decode("utf-8", errors="replace"))
         if evt:
             yield evt
 
@@ -56,7 +68,7 @@ async def parse_sse_stream(byte_stream) -> AsyncIterator[SseEvent]:
 def _parse_raw_event(text: str) -> Optional[SseEvent]:
     """解析单个 SSE 事件块"""
     event = None
-    data_lines = []
+    data_lines: list[str] = []
 
     for line in text.split("\n"):
         line = line.strip()
@@ -95,6 +107,15 @@ class DsFrame:
 FRAG_THINK = "THINK"
 FRAG_RESPONSE = "RESPONSE"
 FRAG_ANSWER = "ANSWER"
+
+
+def _fragment_to_frame(ty: str, content: str) -> Optional[DsFrame]:
+    """将 fragment 类型映射为 DsFrame"""
+    if ty == FRAG_THINK:
+        return DsFrame(type=DsFrameType.THINK_DELTA, value=content)
+    if ty in (FRAG_RESPONSE, FRAG_ANSWER):
+        return DsFrame(type=DsFrameType.CONTENT_DELTA, value=content)
+    return None
 
 
 class DsState:
@@ -170,9 +191,6 @@ class DsState:
         if not isinstance(response, dict):
             return
 
-        thinking_enabled = response.get("thinking_enabled")
-        # 不直接输出, 仅用于 context
-
         fragments = response.get("fragments")
         if not isinstance(fragments, list):
             return
@@ -189,10 +207,9 @@ class DsState:
             self.fragments.append({"type": ty, "content": content})
 
             if content:
-                if ty == FRAG_THINK:
-                    frames.append(DsFrame(type=DsFrameType.THINK_DELTA, value=content))
-                elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
-                    frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=content))
+                frame = _fragment_to_frame(ty, content)
+                if frame:
+                    frames.append(frame)
 
     def _apply_path(self, path: str, op: Optional[str], v: Any) -> list[DsFrame]:
         frames: list[DsFrame] = []
@@ -216,10 +233,9 @@ class DsState:
                 last = self.fragments[-1]
                 ty = last.get("type", "")
                 last["content"] += v
-                if ty == FRAG_THINK:
-                    frames.append(DsFrame(type=DsFrameType.THINK_DELTA, value=v))
-                elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
-                    frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=v))
+                frame = _fragment_to_frame(ty, v)
+                if frame:
+                    frames.append(frame)
 
         elif path == "response/fragments/-1/elapsed_secs":
             pass  # 忽略耗时
@@ -234,10 +250,9 @@ class DsState:
                             content = ""
                         self.fragments.append({"type": ty, "content": content})
                         if content:
-                            if ty == FRAG_THINK:
-                                frames.append(DsFrame(type=DsFrameType.THINK_DELTA, value=content))
-                            elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
-                                frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=content))
+                            frame = _fragment_to_frame(ty, content)
+                            if frame:
+                                frames.append(frame)
 
         return frames
 
@@ -275,14 +290,6 @@ class ChunkChoice:
     finish_reason: Optional[str] = None
 
 
-# Tool call 累积状态
-@dataclass
-class ToolCallAccum:
-    id: str = ""
-    name: str = ""
-    arguments: str = ""
-
-
 async def convert_to_openai_chunks(
     ds_frame_stream,
     model: str = "deepseek-chat",
@@ -298,12 +305,12 @@ async def convert_to_openai_chunks(
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
     created = int(time.time())
     finished = False
+    usage_sent = False
     usage_value: Optional[int] = None
 
     # 工具调用解析状态 (简化: 从 content 中提取 <tool_calls> XML)
     tool_buffer: str = ""
     tool_calls_active = False
-    tool_call_accums: list[ToolCallAccum] = []
 
     def make_chunk(delta: Delta, finish_reason: Optional[str] = None) -> dict:
         c = {
@@ -359,7 +366,6 @@ async def convert_to_openai_chunks(
                 # 检测工具调用开始
                 if not tool_calls_active and "<tool_calls>" in text:
                     tool_calls_active = True
-                    # 取 <tool_calls> 之前的内容 (如果有)
                     before, after = text.split("<tool_calls>", 1)
                     if before.strip():
                         yield make_chunk(Delta(content=before))
@@ -374,7 +380,6 @@ async def convert_to_openai_chunks(
                         tool_calls_active = False
                         parsed = _parse_tool_calls_buffer(tool_buffer)
                         if parsed:
-                            # 转为 OpenAI tool_calls delta 格式
                             tc_deltas = []
                             for i, tc in enumerate(parsed):
                                 tc_deltas.append({
@@ -400,7 +405,8 @@ async def convert_to_openai_chunks(
 
             elif frame.type == DsFrameType.USAGE:
                 usage_value = int(frame.value) if frame.value else 0
-                if finished and include_usage:
+                if finished and include_usage and not usage_sent:
+                    usage_sent = True
                     yield make_usage_chunk(prompt_tokens, usage_value)
 
             elif frame.type == DsFrameType.FINISH:
@@ -409,11 +415,9 @@ async def convert_to_openai_chunks(
                     yield make_chunk(Delta(), finish_reason="stop")
 
     finally:
-        # 确保结束时发送 usage (如果启用)
-        if finished and include_usage and usage_value is not None:
-            not_sent = True  # 简单处理: 如果没发过就补发
-            if not_sent:
-                yield make_usage_chunk(prompt_tokens, usage_value)
+        # 确保结束时发送 usage (如果循环内没发过)
+        if finished and include_usage and not usage_sent and usage_value is not None:
+            yield make_usage_chunk(prompt_tokens, usage_value)
 
 
 def _clean_text(text: Any) -> str:
@@ -422,8 +426,7 @@ def _clean_text(text: Any) -> str:
     # 移除 FINISHED 标记
     text = text.replace("FINISHED", "")
     # 移除搜索关键词前缀
-    import re
-    text = re.sub(r'^(SEARCH|WEB_SEARCH|SEARCHING)\s*', '', text, flags=re.IGNORECASE)
+    text = _RE_SEARCH_PREFIX.sub('', text)
     return text
 
 

@@ -20,3 +20,9 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Environment variables
+.env
+
+# WASM cache
+*.wasm

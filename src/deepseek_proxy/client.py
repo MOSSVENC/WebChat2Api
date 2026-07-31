@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import base64
-from typing import Optional, AsyncIterator, Any
+from typing import Optional, Any
 from dataclasses import dataclass
 
 import httpx
@@ -31,15 +31,13 @@ class LoginPayload:
     os: str = "web"
 
     def to_dict(self) -> dict:
-        d = {"password": self.password, "device_id": self.device_id, "os": self.os}
-        if self.email:
-            d["email"] = self.email
-        else:
-            d["email"] = ""
-        if self.mobile:
-            d["mobile"] = self.mobile
-        else:
-            d["mobile"] = ""
+        d: dict[str, Any] = {
+            "password": self.password,
+            "device_id": self.device_id,
+            "os": self.os,
+        }
+        d["email"] = self.email or ""
+        d["mobile"] = self.mobile or ""
         if self.area_code:
             d["area_code"] = self.area_code
         return d
@@ -155,73 +153,70 @@ class BusinessError(ClientError):
 # ═══════════════════════════════════════════════════════════
 
 class DsClient:
-    """DeepSeek HTTP 客户端 — 无状态, 每个方法对应一个端点"""
+    """DeepSeek HTTP 客户端 — 无状态, 每个方法对应一个 REST 端点。"""
 
     def __init__(self, config: ProxyConfig):
         self.config = config
-        self._http = httpx.AsyncClient(timeout=config.http_timeout)
+        limits = httpx.Limits(
+            max_connections=64,
+            max_keepalive_connections=16,
+        )
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.http_timeout),
+            limits=limits,
+            follow_redirects=True,
+        )
 
-    # ── 请求头构建 ──────────────────────────────────────
-
-    def _base_headers(self, token: Optional[str] = None,
+    def _base_headers(self, token: str,
                       pow_response: Optional[str] = None) -> dict[str, str]:
-        h = {
+        headers = {
             "User-Agent": self.config.user_agent,
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept": "application/json, text/event-stream",
+            "Accept-Language": self.config.client_locale,
+            "Content-Type": "application/json",
             "Origin": "https://chat.deepseek.com",
             "Referer": "https://chat.deepseek.com/",
-            "X-App-Version": self.config.app_version,
-            "X-Client-Locale": self.config.client_locale,
-            "X-Client-Platform": self.config.client_platform,
             "X-Client-Version": self.config.client_version,
-            "Content-Type": "application/json",
+            "X-Client-Platform": self.config.client_platform,
+            "X-App-Version": self.config.app_version,
+            "Authorization": f"Bearer {token}",
         }
-        if token:
-            h["Authorization"] = f"Bearer {token}"
         if pow_response:
-            h["X-Ds-Pow-Response"] = pow_response
-        return h
-
-    # ── 信封解析 ────────────────────────────────────────
+            headers["X-Ds-Pow-Response"] = pow_response
+        return headers
 
     async def _parse_envelope(self, resp: httpx.Response) -> dict:
-        """解析 Envelope: {code, msg, data: {biz_code, biz_msg, biz_data}}"""
+        """解析 DeepSeek API 响应信封: {success, data, msg}"""
         if resp.status_code != 200:
-            body = resp.text
-            raise HTTPStatusError(resp.status_code, body)
+            body = await resp.aread()
+            raise HTTPStatusError(resp.status_code, body.decode())
 
-        envelope = resp.json()
-        code = envelope.get("code", -1)
-        if code != 0:
-            raise BusinessError(code, envelope.get("msg", "unknown"))
+        data = resp.json()
 
-        data = envelope.get("data")
-        if not data:
-            raise BusinessError(-1, "missing data")
-
-        biz_code = data.get("biz_code", -1)
-        if biz_code != 0:
-            raise BusinessError(biz_code, data.get("biz_msg", "unknown"))
-
-        biz_data = data.get("biz_data")
-        if biz_data is None:
-            raise BusinessError(-1, "missing biz_data")
+        # 有时 API 直接返回数据, 有时包在 {success, data} 里
+        if isinstance(data, dict):
+            if "success" in data:
+                if not data.get("success"):
+                    raise BusinessError(
+                        data.get("code", -1),
+                        data.get("msg", "unknown error"),
+                    )
+                biz_data = data.get("data", {})
+            else:
+                biz_data = data
+        else:
+            biz_data = data
 
         return biz_data
 
-    # ── API 方法 ────────────────────────────────────────
-
     async def login(self, payload: LoginPayload) -> LoginData:
-        """邮箱/手机号 + 密码登录"""
+        """登录获取 token"""
         resp = await self._http.post(
             f"{self.config.api_base}{ENDPOINT_USERS_LOGIN}",
-            headers=self._base_headers(),
+            headers=self._base_headers(token=""),
             json=payload.to_dict(),
         )
         biz_data = await self._parse_envelope(resp)
-
         user = biz_data.get("user", {})
         return LoginData(
             code=biz_data.get("code", 0),
@@ -250,7 +245,6 @@ class DsClient:
             json={"character_id": None},
         )
         biz_data = await self._parse_envelope(resp)
-        # biz_data 可能是 {"chat_session": {"id": "..."}} 或 {"id": "..."}
         if "chat_session" in biz_data:
             return biz_data["chat_session"]["id"]
         return biz_data["id"]
@@ -262,7 +256,7 @@ class DsClient:
             headers=self._base_headers(token=token),
             json={"chat_session_id": session_id},
         )
-        await self._parse_envelope(resp)  # 验证成功
+        await self._parse_envelope(resp)
 
     async def create_pow_challenge(self, token: str,
                                    target_path: str = "/api/v0/chat/completion") -> ChallengeData:
@@ -273,7 +267,6 @@ class DsClient:
             json={"target_path": target_path},
         )
         biz_data = await self._parse_envelope(resp)
-        # biz_data 可能是 {"challenge": {...}} 或直接是 challenge
         challenge = biz_data.get("challenge", biz_data)
         return ChallengeData(
             algorithm=challenge["algorithm"],

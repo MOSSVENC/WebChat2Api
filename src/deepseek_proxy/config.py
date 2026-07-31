@@ -1,7 +1,12 @@
 """
-DeepSeek Proxy — 配置文件 (硬编码, 后续迁移到 config.toml)
+DeepSeek Proxy — 配置文件
+
+支持环境变量覆盖，也可直接修改下方 CONFIG 对象。
 """
 
+from __future__ import annotations
+
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
@@ -9,33 +14,17 @@ from enum import Enum
 
 class AuthMode(str, Enum):
     PASSWORD = "password"       # 邮箱/手机号 + 密码自动登录
-    TOKEN = "token"              # 手动提供 Bearer Token
+    TOKEN = "token"             # 手动提供 Bearer Token
 
 
 class SessionMode(str, Enum):
-    REUSE = "reuse"              # 初始化时创建 session, 永久复用 edit_message
-    NEW = "new"                  # 每次请求新建 session + completion
+    REUSE = "reuse"             # 初始化时创建 session, 永久复用 edit_message
+    NEW = "new"                 # 每次请求新建 session + completion
 
 
 class DeepSeekModel(str, Enum):
     DEFAULT = "default"                # deepseek-v4-flash（非思考模式）
     DEFAULT_SEARCH = "default_search"  # deepseek-v4-flash + 搜索
-
-    @property
-    def model_type(self) -> str:
-        """映射到 DeepSeek API 的 model_type 字段。
-        所有 v4 模型统一使用 'default'，思考模式通过请求参数独立控制。
-        """
-        return "default"
-
-    @property
-    def thinking_enabled(self) -> bool:
-        """思考模式由请求参数控制，不再依赖枚举值。"""
-        return False
-
-    @property
-    def search_enabled(self) -> bool:
-        return self is DeepSeekModel.DEFAULT_SEARCH
 
 
 @dataclass
@@ -56,7 +45,7 @@ class ProxyConfig:
     client_locale: str = "zh-CN"
 
     # === 认证 ===
-    auth_mode: AuthMode = AuthMode.PASSWORD
+    auth_mode: AuthMode = AuthMode.TOKEN
 
     # --- AuthMode.PASSWORD 专用 ---
     account_email: str = ""
@@ -84,7 +73,7 @@ class ProxyConfig:
     token_refresh_interval: int = 3000  # 秒 (50 分钟, 保守)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ProxyConfig":
+    def from_dict(cls, d: dict) -> ProxyConfig:
         """从字典构造, 覆盖默认值"""
         import dataclasses
         fields = {f.name for f in dataclasses.fields(cls)}
@@ -99,27 +88,37 @@ class ProxyConfig:
         return cls(**kwargs)
 
 
-# === 默认全局配置 (硬编码, 开发阶段直接改这里) ===
+def _env(key: str, default: str = "") -> str:
+    """从环境变量读取，不存在则返回 default"""
+    return os.environ.get(key, default)
+
+
+def _env_list(key: str, default: str = "") -> list[str]:
+    """从环境变量读取逗号分隔列表"""
+    val = os.environ.get(key, default)
+    return [s.strip() for s in val.split(",") if s.strip()]
+
+
+# === 默认全局配置 (可通过环境变量覆盖) ===
 CONFIG = ProxyConfig(
- # 认证: 改为 TOKEN 模式则填 user_token
- auth_mode=AuthMode.TOKEN,
+    # 认证: 改为 TOKEN 模式则填 user_token
+    auth_mode=AuthMode(_env("DS_AUTH_MODE", "token")),
 
- # 账号密码登录 (auth_mode=password 时使用)
- account_email="",
- account_mobile="",
- account_area_code="",
- account_password="",
+    # 账号密码登录 (auth_mode=password 时使用)
+    account_email=_env("DS_EMAIL"),
+    account_mobile=_env("DS_MOBILE"),
+    account_area_code=_env("DS_AREA_CODE"),
+    account_password=_env("DS_PASSWORD"),
 
- # Bearer Token (auth_mode=token 时使用)
- user_token="1TR1JHiK3s20p9PQslvGsXn9skWljioxUhKBqTP4FQhmG+cmRMYWiTmmo2sReb1N",
+    # Bearer Token (auth_mode=token 时使用)
+    # ⚠️ 不要在代码中硬编码 token，请通过 DS_TOKEN 环境变量传入
+    user_token=_env("DS_TOKEN"),
 
- # 此token已作废，已畏惧，不要再用我的token了
- # I'm scared. Don't use up my tokens! This token has been revoked.
     # 会话策略
-    session_mode=SessionMode.REUSE,
+    session_mode=SessionMode(_env("DS_SESSION_MODE", "reuse")),
 
     # 服务器
-    server_host="127.0.0.1",
-    server_port=5317,
-    api_tokens=[],   # 空 = 无需 API key
+    server_host=_env("DS_HOST", "127.0.0.1"),
+    server_port=int(_env("DS_PORT", "5317")),
+    api_tokens=_env_list("DS_API_TOKENS"),
 )

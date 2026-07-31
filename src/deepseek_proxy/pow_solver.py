@@ -8,15 +8,17 @@ PoW 求解器 — 通过 wasmtime-py 执行 DeepSeekHashV1 WASM
 
 from __future__ import annotations
 
-import ctypes
 import json
 import struct
+import logging
 from dataclasses import dataclass
 from typing import Optional, Any
 
 import httpx
 
 from .client import ChallengeData, build_pow_header
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -55,10 +57,8 @@ class PowSolver:
     """基于 wasmtime-py 的 DeepSeekHashV1 PoW 求解器
 
     动态探测 WASM 导出符号，不硬编码名称。
+    首次 solve() 后缓存 linker 提升后续性能。
     """
-
-    # 本地 WASM 缓存路径（优先使用，避免网络下载）
-    LOCAL_WASM_PATH = "copyed/Chat2API/sha3_wasm_bg.7b9ca65ddd.wasm"
 
     def __init__(self, wasm_bytes: bytes):
         self._wasm_bytes = wasm_bytes
@@ -67,9 +67,10 @@ class PowSolver:
         self._linker: Any = None
         self._store_cls: Any = None
         self._wasi_config: Any = None
+        self._inited = False
 
     async def init(self) -> None:
-        """延迟初始化 WASM engine (首次使用时调用)"""
+        """初始化 WASM engine"""
         try:
             import wasmtime
         except ImportError:
@@ -81,26 +82,30 @@ class PowSolver:
         self._store_cls = wasmtime.Store
         self._wasi_config = wasmtime.WasiConfig()
 
-        module = wasmtime.Module(self._engine, self._wasm_bytes)
-        self._module = module
+        self._module = wasmtime.Module(self._engine, self._wasm_bytes)
 
-        # 收集所有导出
-        exports = list(module.exports)
+        # 预构建 linker（含 WASI 定义），后续复用
+        linker = wasmtime.Linker(self._engine)
+        linker.define_wasi()
+        self._linker = linker
 
         # 动态查找关键导出
-        self._add_to_stack = self._find_add_to_stack(exports)
-        self._alloc = self._find_alloc(exports)
-        self._solve = self._find_solve(exports)
+        exports = list(self._module.exports)
+        self._add_to_stack = self._find_export(exports, "__wbindgen_add_to_stack_pointer")
+        self._alloc = self._find_alloc_export(exports)
+        self._solve = self._find_export(exports, "wasm_solve")
 
-    def _find_add_to_stack(self, exports) -> str:
-        """查找 __wbindgen_add_to_stack_pointer"""
+        self._inited = True
+
+    @staticmethod
+    def _find_export(exports, name: str) -> str:
         for exp in exports:
-            if exp.name == "__wbindgen_add_to_stack_pointer":
+            if exp.name == name:
                 return exp.name
-        raise PowError("__wbindgen_add_to_stack_pointer not found in WASM")
+        raise PowError(f"{name} not found in WASM")
 
-    def _find_alloc(self, exports) -> str:
-        """查找内存分配器: 优先 __wbindgen_malloc, 其次 __wbindgen_export_*"""
+    @staticmethod
+    def _find_alloc_export(exports) -> str:
         for exp in exports:
             if exp.name == "__wbindgen_malloc":
                 return exp.name
@@ -109,52 +114,32 @@ class PowSolver:
                 return exp.name
         raise PowError("allocator export not found in WASM")
 
-    def _find_solve(self, exports) -> str:
-        """查找 wasm_solve 函数"""
-        for exp in exports:
-            if exp.name == "wasm_solve":
-                return exp.name
-        raise PowError("wasm_solve not found in WASM")
-
     def solve(self, challenge: ChallengeData) -> PowResult:
-        """求解 PoW 挑战
-
-        Args:
-            challenge: 从 create_pow_challenge 获取的挑战数据
-
-        Returns:
-            PowResult with answer
-
-        Raises:
-            PowError: 算法不支持、WASM 执行失败、无解
-        """
+        """求解 PoW 挑战"""
         if challenge.algorithm != "DeepSeekHashV1":
             raise PowError(f"Unsupported algorithm: {challenge.algorithm}")
 
-        if not self._engine:
+        if not self._inited:
             raise PowError("Solver not initialized. Call init() first.")
 
         import wasmtime
 
         store = self._store_cls(self._engine, self._wasi_config)
-        linker = wasmtime.Linker(self._engine)
-        linker.define_wasi()
-        instance = linker.instantiate(store, self._module)
+        instance = self._linker.instantiate(store, self._module)
 
         memory = instance.exports(store)["memory"]
         add_to_stack = instance.exports(store)[self._add_to_stack]
         alloc = instance.exports(store)[self._alloc]
         solve_fn = instance.exports(store)[self._solve]
 
-        # data_ptr 返回 ctypes.LP_c_ubyte，支持直接索引读写
         base = memory.data_ptr(store)
 
         retptr = add_to_stack(store, -16)
         prefix = f"{challenge.salt}_{challenge.expire_at}_"
 
-        ptr_challenge, len_challenge = _write_string(store, memory, base, alloc,
+        ptr_challenge, len_challenge = _write_string(store, base, alloc,
             challenge.challenge)
-        ptr_prefix, len_prefix = _write_string(store, memory, base, alloc, prefix)
+        ptr_prefix, len_prefix = _write_string(store, base, alloc, prefix)
 
         solve_fn(store, retptr,
             ptr_challenge, len_challenge,
@@ -162,7 +147,6 @@ class PowSolver:
             float(challenge.difficulty))
 
         # 读返回值: status (i32 at +0), value (f64 at +8)
-        # 使用 base[...] 直接索引读取（ctypes.LP_c_ubyte 支持）
         status_bytes = bytes(base[retptr + i] for i in range(4))
         value_bytes = bytes(base[retptr + 8 + i] for i in range(8))
 
@@ -174,6 +158,8 @@ class PowSolver:
         if status == 0:
             raise PowError("No solution found")
 
+        logger.debug("PoW solved: answer=%d, difficulty=%d", int(value), challenge.difficulty)
+
         return PowResult(
             algorithm=challenge.algorithm,
             challenge=challenge.challenge,
@@ -184,12 +170,8 @@ class PowSolver:
         )
 
 
-def _write_string(store, memory, base, alloc, text: str) -> tuple[int, int]:
-    """WASM 内存写入字符串, 返回 (ptr, len)
-
-    使用 ctypes.LP_c_ubyte 直接索引写入: base[ptr+i] = byte
-    这是 wasmtime 返回的 memory data_ptr 的正确用法。
-    """
+def _write_string(store, base, alloc, text: str) -> tuple[int, int]:
+    """WASM 内存写入字符串, 返回 (ptr, len)"""
     data = text.encode("utf-8")
     ptr = alloc(store, len(data), 1)
     for i, b in enumerate(data):
@@ -201,22 +183,8 @@ def _write_string(store, memory, base, alloc, text: str) -> tuple[int, int]:
 # WASM 下载 & 缓存
 # ═══════════════════════════════════════════════════════════
 
-def _get_local_wasm_path() -> Optional[str]:
-    """返回本地 WASM 缓存路径（如果存在）"""
-    import os
-    path = PowSolver.LOCAL_WASM_PATH
-    if os.path.exists(path):
-        return path
-    return None
-
-
 async def fetch_wasm(wasm_url: str) -> bytes:
-    """下载 WASM 二进制（优先本地缓存）"""
-    local = _get_local_wasm_path()
-    if local:
-        with open(local, "rb") as f:
-            return f.read()
-
+    """下载 WASM 二进制"""
     async with httpx.AsyncClient(timeout=30.0) as http:
         resp = await http.get(wasm_url)
         resp.raise_for_status()

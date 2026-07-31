@@ -1,15 +1,5 @@
 # DeepSeek Proxy
 
-> **⚠️ 此仓库的旧 token 已失效，请勿再用它测试**  
-> **⚠️ The old token in this repo has been revoked. Do NOT use it for testing.**
->
-> ![no](no.png)
->
-> **🔑 如需测试，请登录自己的 DeepSeek 账号，按 F12 打开浏览器开发工具查找你的 Bearer Token**  
-> **🔑 To test, log into your own DeepSeek account, press F12, and find your Bearer Token in DevTools.**
->
-> ![yes](yes.png)
-
 DeepSeek 网页 API 反代，提供 OpenAI 兼容端点，可直接替代 OpenAI API base URL 使用。
 
 无需 Electron，纯 Python 实现，支持 DeepSeek-V4-Flash（快速对话）和 DeepSeek-V4-Pro（深度推理）模型。
@@ -25,18 +15,84 @@ DeepSeek 网页 API 反代，提供 OpenAI 兼容端点，可直接替代 OpenAI
 - **PoW 反爬** — 自动下载 WASM 模块并求解工作量证明
 - **流式响应** — Server-Sent Events 流式输出，支持 `reasoning_content`（V4-Pro 推理过程）
 - **CORS 支持** — 跨域请求开箱即用
+- **环境变量配置** — 敏感信息（Token）通过环境变量传入，无需硬编码
 
 ---
 
-## 技术栈
+## 快速开始
 
-| 组件 | 用途 |
-|------|------|
-| FastAPI | HTTP 服务器，路由与中间件 |
-| httpx | 异步 HTTP 客户端，支持 SOCKS 代理 |
-| uvicorn | ASGI 服务器 |
-| pydantic | 数据模型与验证 |
-| wasmtime | WebAssembly 运行时，执行 PoW WASM 模块 |
+### 环境要求
+
+- Python 3.12+
+- UV 包管理器（推荐）
+
+### 安装
+
+```bash
+# 克隆
+git clone https://github.com/MOSSVENC/chat2api_reborn.git
+cd chat2api_reborn
+
+# 复制环境变量模板
+cp .env.example .env
+
+# 编辑 .env，填入你的 Token
+# DS_TOKEN=your-bearer-token-here
+
+# 使用 UV 安装依赖并运行
+uv sync
+uv run deepseek-proxy
+```
+
+服务将在 `http://127.0.0.1:5317` 启动。
+
+### 全局安装（可选）
+
+```bash
+uv pip install -e .
+deepseek-proxy
+```
+
+---
+
+## 配置
+
+### 环境变量（推荐）
+
+```bash
+# 认证模式
+DS_AUTH_MODE=token  # 或 password
+
+# Token 模式
+DS_TOKEN=your-bearer-token
+
+# Password 模式
+DS_EMAIL=example@mail.com
+DS_PASSWORD=your-password
+
+# 会话策略
+DS_SESSION_MODE=reuse  # 或 new
+
+# 服务器
+DS_HOST=127.0.0.1
+DS_PORT=5317
+
+# API Key 鉴权 (逗号分隔，留空=不鉴权)
+DS_API_TOKENS=your-api-key1,your-api-key2
+```
+
+### 配置参数说明
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `DS_AUTH_MODE` | `token` | 认证方式 |
+| `DS_TOKEN` | — | Bearer Token（auth_mode=token 时） |
+| `DS_EMAIL` | — | 邮箱（auth_mode=password 时） |
+| `DS_PASSWORD` | — | 密码（auth_mode=password 时） |
+| `DS_SESSION_MODE` | `reuse` | REUSE 复用 session；NEW 每次新建 |
+| `DS_HOST` | `127.0.0.1` | 监听地址 |
+| `DS_PORT` | `5317` | 监听端口 |
+| `DS_API_TOKENS` | — | API Key 鉴权列表，留空=不鉴权 |
 
 ---
 
@@ -48,7 +104,7 @@ GET  /v1/models          可用模型列表
 POST /v1/chat/completions  对话补全（流式）
 ```
 
-请求示例（OpenAI SDK）:
+### 请求示例（OpenAI SDK）
 
 ```python
 from openai import OpenAI
@@ -75,7 +131,7 @@ stream = client.chat.completions.create(
 )
 ```
 
-curl 示例:
+### curl 示例
 
 ```bash
 curl -X POST http://127.0.0.1:5317/v1/chat/completions \
@@ -85,74 +141,14 @@ curl -X POST http://127.0.0.1:5317/v1/chat/completions \
 
 ---
 
-## 快速开始
+## 模型映射
 
-### 环境要求
-
-- Python 3.12+
-- UV 包管理器（推荐）
-
-### 安装
-
-```bash
-# 克隆
-git clone https://github.com/MOSSVENC/chat2api_reborn.git
-cd chat2api_reborn
-
-# 使用 UV 安装依赖并运行
-uv sync
-uv run deepseek-proxy
-```
-
-服务将在 `http://127.0.0.1:5317` 启动。
-
-### 全局安装（可选）
-
-```bash
-uv pip install -e .
-deepseek-proxy
-```
-
----
-
-## 配置
-
-编辑 `src/deepseek_proxy/config.py` 中的 `CONFIG` 对象：
-
-```python
-CONFIG = ProxyConfig(
-    # 认证模式: TOKEN（默认）或 PASSWORD
-    auth_mode=AuthMode.TOKEN,
-    user_token="your-bearer-token-here",
-
-    # PASSWORD 模式用这些字段
-    # account_email="example@mail.com",
-    # account_password="your-password",
-
-    # 会话策略: REUSE 或 NEW
-    session_mode=SessionMode.REUSE,
-
-    # 服务器
-    server_host="127.0.0.1",
-    server_port=5317,
-    api_tokens=[],  # 空 = 不鉴权，可填入 API Key 列表
-)
-```
-
-### 配置参数说明
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `auth_mode` | `TOKEN` | 认证方式 |
-| `user_token` | — | Bearer Token（auth_mode=TOKEN 时） |
-| `account_email` | — | 邮箱（auth_mode=PASSWORD 时） |
-| `account_password` | — | 密码（auth_mode=PASSWORD 时） |
-| `session_mode` | `REUSE` | REUSE 复用 session；NEW 每次新建 |
-| `server_host` | `127.0.0.1` | 监听地址 |
-| `server_port` | `5317` | 监听端口 |
-| `api_tokens` | `[]` | API Key 鉴权列表，空=不鉴权 |
-| `default_model` | `DEFAULT` | 默认模型 |
-| `http_timeout` | `120.0` | HTTP 请求超时（秒） |
+| OpenAI 模型名 | 模型 | 类型 | 备注 |
+|--------------|------|------|------|
+| `deepseek-v4-flash` | DeepSeek-V4-Flash | 快速对话（默认） | 推荐使用 |
+| `deepseek-v4-pro` | DeepSeek-V4-Pro | 深度推理（默认开启思考） | 推荐使用 |
+| `deepseek-chat` | DeepSeek-V4-Flash | 快速对话 | **将于 2026/07/24 弃用**，迁移至 `deepseek-v4-flash` |
+| `deepseek-reasoner` | DeepSeek-V4-Flash | 思考模式 | **将于 2026/07/24 弃用**，迁移至 `deepseek-v4-pro` |
 
 ---
 
@@ -161,13 +157,14 @@ CONFIG = ProxyConfig(
 ```
 src/deepseek_proxy/
 ├── __init__.py          模块入口，导出核心类型
-├── config.py            配置定义与默认 CONFIG
+├── config.py            配置定义 (支持环境变量覆盖)
 ├── client.py            DsClient HTTP 客户端
-├── auth.py              双通道认证（密码 / Token）
-├── pow_solver.py        PoW 求解（WASM + wasmtime）
-├── sessions.py          会话管理（复用 / 新建策略）
+├── auth.py              双通道认证 (密码 / Token)
+├── pow_solver.py        PoW 求解 (WASM + wasmtime)
+├── sessions.py          会话管理 (复用 / 新建策略)
 ├── prompt.py            ChatML prompt 构建
 ├── sse_parser.py        SSE 流解析 Pipeline
+├── jailbreak.py         破限模板系统
 ├── openai_adapter.py    OpenAI 请求 → DeepSeek 请求适配
 ├── server.py            FastAPI 服务器，定义所有端点
 └── main.py              入口，asyncio 事件循环 + cli()
@@ -175,23 +172,12 @@ src/deepseek_proxy/
 
 ---
 
-## 模型映射
-
-| OpenAI 模型名 | 模型 | 类型 | 备注 |
-|--------------|------|------|------|
-| `deepseek-v4-flash` | DeepSeek-V4-Flash | 快速对话（默认） | 替代 `deepseek-chat` |
-| `deepseek-v4-pro` | DeepSeek-V4-Pro | 深度推理（默认开启思考） | 替代 `deepseek-reasoner` |
-| `deepseek-chat` | DeepSeek-V4-Flash | 快速对话 | **将于 2026/07/24 弃用**，迁移至 `deepseek-v4-flash` |
-| `deepseek-reasoner` | DeepSeek-V4-Flash | 思考模式 | **将于 2026/07/24 弃用**，迁移至 `deepseek-v4-pro` |
-
----
-
 ## 注意事项
 
 - 本项目仅供学习和研究使用，请遵守 DeepSeek 服务条款
-- Bearer Token 从浏览器开发者工具获取（登录 chat.deepseek.com 后）
+- **不要在代码中硬编码 Token**，请通过环境变量或 `.env` 文件传入
 - PoW 求解会消耗 CPU 资源，首次启动需要下载 WASM 文件
-- 生产环境建议配置 API Key 鉴权 `api_tokens`
+- 生产环境建议配置 API Key 鉴权 `DS_API_TOKENS`
 - REUSE 模式下 session 永久复用，适合长对话；NEW 模式适合独立请求
 
 ---

@@ -10,10 +10,12 @@ FastAPI HTTP 服务器 — OpenAI 兼容端点
 from __future__ import annotations
 
 import json
+import uuid
 import asyncio
-from typing import Optional, Any
+import logging
+from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,6 +29,8 @@ from .sessions import (
 )
 from .openai_adapter import OpenAIAdapter
 from .sse_parser import full_sse_pipeline
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -45,9 +49,6 @@ class AppState:
 
     async def init(self):
         """初始化所有组件"""
-        import logging
-        logger = logging.getLogger("deepseek_proxy")
-
         # 1. HTTP 客户端
         logger.info("初始化 HTTP 客户端...")
         self.client = DsClient(self.config)
@@ -96,6 +97,27 @@ def get_state() -> AppState:
 
 
 # ═══════════════════════════════════════════════════════════
+# 模型列表 (从枚举生成，避免硬编码重复)
+# ═══════════════════════════════════════════════════════════
+
+_MODEL_REGISTRY: list[dict] = [
+    # 新默认模型
+    {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
+    # 思考模型
+    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+    # 向后兼容 (即将弃用)
+    {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
+    {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
+]
+
+# model_type → 兼容模型 ID 映射
+_COMPAT_MODEL_MAP: dict[str, str] = {
+    "default": "deepseek-v4-flash",
+    "default_search": "deepseek-v4-flash",
+}
+
+
+# ═══════════════════════════════════════════════════════════
 # FastAPI App
 # ═══════════════════════════════════════════════════════════
 
@@ -120,11 +142,9 @@ def create_app(config: ProxyConfig) -> FastAPI:
     # API Key 验证中间件
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        # 跳过 health endpoint
         if request.url.path == "/health":
             return await call_next(request)
 
-        # 如果有配置 api_tokens 则验证
         state = _app_state
         if state and state.config.api_tokens:
             auth_header = request.headers.get("Authorization", "")
@@ -147,20 +167,15 @@ def create_app(config: ProxyConfig) -> FastAPI:
     @app.get("/v1/models")
     async def list_models():
         """返回可用模型列表"""
-        models = [
-            # 新默认模型 — DeepSeek-V4 Flash (快速, 替代 deepseek-chat)
-            {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
-            # 思考模型 — DeepSeek-V4 Pro (深度推理, 替代 deepseek-reasoner)
-            {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
-            # 向后兼容 — 映射到 deepseek-v4-flash (DeepSeek-V3.2, 即将弃用)
-            {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
-            # 向后兼容 — 映射到 deepseek-v4-pro (DeepSeek-R1, 即将弃用)
-            {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
-        ]
-        # 根据配置添加旧模型变体 (向后兼容)
-        for mt in _app_state.config.model_types if _app_state else ["default"]:
-            if mt == "default":
-                models.append({"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"})
+        state = _app_state
+        models = list(_MODEL_REGISTRY)
+
+        # 根据配置追加兼容模型
+        if state:
+            for mt in state.config.model_types:
+                compat_id = _COMPAT_MODEL_MAP.get(mt)
+                if compat_id and not any(m["id"] == compat_id for m in models):
+                    models.append({"id": compat_id, "object": "model", "owned_by": "deepseek"})
 
         return {"object": "list", "data": models}
 
@@ -200,61 +215,14 @@ def create_app(config: ProxyConfig) -> FastAPI:
                 jailbreak=jailbreak,
             )
         except Exception as e:
-            import logging
-            logging.getLogger("deepseek_proxy").error("Chat failed: %s", e)
+            logger.error("Chat failed: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
         if not stream:
-            # 非流式: 累积内容后返回
-            full_content = ""
-            async for chunk in full_sse_pipeline(
-                resp.aiter_bytes(),
-                model=model,
-            ):
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                if delta.get("content"):
-                    full_content += delta["content"]
-                elif delta.get("reasoning_content"):
-                    pass  # 非流式暂不处理 reasoning
-
-            return {
-                "id": f"chatcmpl-{id(full_content)}",
-                "object": "chat.completion",
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": full_content},
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
-
-        # 流式: SSE 响应
-        async def event_stream():
-            try:
-                async for chunk in full_sse_pipeline(
-                    resp.aiter_bytes(),
-                    model=model,
-                ):
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                error_chunk = {
-                    "error": {"message": "Stream error", "type": "server_error"}
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-            finally:
-                # 清理 session (NEW 模式)
-                session_id = getattr(resp, "_session_id", None)
-                if session_id:
-                    state = get_state()
-                    await cleanup_session(state.client, state.token, session_id)
+            return await _handle_non_stream(resp, model)
 
         return StreamingResponse(
-            event_stream(),
+            _event_stream(resp, model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -264,6 +232,50 @@ def create_app(config: ProxyConfig) -> FastAPI:
         )
 
     return app
+
+
+# ═══════════════════════════════════════════════════════════
+# 流式/非流式处理
+# ═══════════════════════════════════════════════════════════
+
+async def _handle_non_stream(resp, model: str) -> dict:
+    """非流式: 累积内容后返回"""
+    full_content = ""
+    async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model):
+        delta = chunk.get("choices", [{}])[0].get("delta", {})
+        if delta.get("content"):
+            full_content += delta["content"]
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": full_content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+async def _event_stream(resp, model: str):
+    """流式 SSE 生成器"""
+    try:
+        async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model):
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception:
+        logger.exception("Stream error")
+        error_chunk = {"error": {"message": "Stream error", "type": "server_error"}}
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        # 清理 session (NEW 模式)
+        session_id = getattr(resp, "_session_id", None)
+        if session_id:
+            state = get_state()
+            await cleanup_session(state.client, state.token, session_id)
 
 
 # ═══════════════════════════════════════════════════════════

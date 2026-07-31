@@ -8,12 +8,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
 from .config import ProxyConfig, AuthMode
-from .client import DsClient, LoginPayload, UserInfo, LoginData, ClientError
+from .client import DsClient, LoginPayload, LoginData, ClientError
 
 
 class AuthProvider(ABC):
@@ -21,25 +22,19 @@ class AuthProvider(ABC):
 
     @abstractmethod
     async def authenticate(self) -> str:
-        """执行认证, 返回 Bearer token"""
         ...
 
     @abstractmethod
     async def validate(self, token: str) -> bool:
-        """验证 token 是否有效"""
         ...
 
     @abstractmethod
     async def refresh(self, token: str) -> Optional[str]:
-        """刷新 token (如果支持), 返回新 token 或 None"""
         ...
 
 
 class PasswordAuthProvider(AuthProvider):
-    """通过邮箱/手机号 + 密码登录获取 token
-
-    对应 ds-free-api 的 init_account() → client.login()
-    """
+    """通过邮箱/手机号 + 密码登录获取 token"""
 
     def __init__(self, config: ProxyConfig, client: DsClient):
         self.config = config
@@ -61,7 +56,6 @@ class PasswordAuthProvider(AuthProvider):
         if not payload.password:
             raise ValueError("password 不能为空")
 
-        # 3 次重试
         last_error = None
         for attempt in range(1, 4):
             try:
@@ -70,7 +64,6 @@ class PasswordAuthProvider(AuthProvider):
             except ClientError as e:
                 last_error = e
                 if attempt < 3:
-                    import asyncio
                     await asyncio.sleep(2)
 
         raise last_error or ClientError("login failed after 3 attempts")
@@ -83,7 +76,6 @@ class PasswordAuthProvider(AuthProvider):
             return False
 
     async def refresh(self, token: str) -> Optional[str]:
-        # 密码登录不能 refresh token, 需要重新登录
         try:
             return await self.authenticate()
         except ClientError:
@@ -101,10 +93,7 @@ class PasswordAuthProvider(AuthProvider):
 
 
 class TokenAuthProvider(AuthProvider):
-    """通过手动提供的 Bearer Token 认证
-
-    对应 Chat2API 的 DeepSeekAdapter.validateToken()
-    """
+    """通过手动提供的 Bearer Token 认证"""
 
     def __init__(self, config: ProxyConfig, client: DsClient):
         self.config = config
@@ -115,9 +104,8 @@ class TokenAuthProvider(AuthProvider):
     async def authenticate(self) -> str:
         token = self.config.user_token
         if not token:
-            raise ValueError("user_token 不能为空 (在 config.py 中设置)")
+            raise ValueError("user_token 不能为空 (通过 DS_TOKEN 环境变量或 config.py 设置)")
 
-        # 验证
         if not await self.validate(token):
             raise ClientError("Token 无效或已过期")
 
@@ -133,7 +121,6 @@ class TokenAuthProvider(AuthProvider):
             return False
 
     async def refresh(self, token: str) -> Optional[str]:
-        # Token 模式下直接重新验证, 如果失败就是过期了
         if await self.validate(token):
             return token
         return None
@@ -148,7 +135,6 @@ class TokenAuthProvider(AuthProvider):
 
 
 def create_auth_provider(config: ProxyConfig, client: DsClient) -> AuthProvider:
-    """工厂函数: 根据配置创建对应的认证提供者"""
     if config.auth_mode == AuthMode.PASSWORD:
         return PasswordAuthProvider(config, client)
     elif config.auth_mode == AuthMode.TOKEN:
