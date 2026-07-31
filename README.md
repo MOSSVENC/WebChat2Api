@@ -147,8 +147,6 @@ curl -X POST http://127.0.0.1:5317/v1/chat/completions \
 |--------------|------|------|------|
 | `deepseek-v4-flash` | DeepSeek-V4-Flash | 快速对话（默认） | 推荐使用 |
 | `deepseek-v4-pro` | DeepSeek-V4-Pro | 深度推理（默认开启思考） | 推荐使用 |
-| `deepseek-chat` | DeepSeek-V4-Flash | 快速对话 | **将于 2026/07/24 弃用**，迁移至 `deepseek-v4-flash` |
-| `deepseek-reasoner` | DeepSeek-V4-Flash | 思考模式 | **将于 2026/07/24 弃用**，迁移至 `deepseek-v4-pro` |
 
 ---
 

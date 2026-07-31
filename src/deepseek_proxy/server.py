@@ -105,16 +105,8 @@ _MODEL_REGISTRY: list[dict] = [
     {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
     # 思考模型
     {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
-    # 向后兼容 (即将弃用)
-    {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
-    {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
 ]
 
-# model_type → 兼容模型 ID 映射
-_COMPAT_MODEL_MAP: dict[str, str] = {
-    "default": "deepseek-v4-flash",
-    "default_search": "deepseek-v4-flash",
-}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -167,17 +159,7 @@ def create_app(config: ProxyConfig) -> FastAPI:
     @app.get("/v1/models")
     async def list_models():
         """返回可用模型列表"""
-        state = _app_state
-        models = list(_MODEL_REGISTRY)
-
-        # 根据配置追加兼容模型
-        if state:
-            for mt in state.config.model_types:
-                compat_id = _COMPAT_MODEL_MAP.get(mt)
-                if compat_id and not any(m["id"] == compat_id for m in models):
-                    models.append({"id": compat_id, "object": "model", "owned_by": "deepseek"})
-
-        return {"object": "list", "data": models}
+        return {"object": "list", "data": list(_MODEL_REGISTRY)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
