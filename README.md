@@ -197,8 +197,8 @@ response = client.chat.completions.create(
 
 | 请求模型名 | 实际模型 | 模式 | 备注 |
 |-----------|---------|------|------|
-| `deepseek-v4-flash` | DeepSeek-V4-Flash | 快速对话（默认） | **推荐** |
-| `deepseek-v4-pro` | DeepSeek-V4-Pro | 深度推理（默认思考） | **推荐** |
+| `deepseek-v4-flash` | DeepSeek-V4-Flash | 快速对话（默认） |  |
+| `deepseek-v4-pro` | DeepSeek-V4-Pro | 深度推理（默认思考） |  |
 
 ---
 
