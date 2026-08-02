@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from .config import ProxyConfig, SessionMode
 from .client import DsClient, CompletionPayload, EditMessagePayload

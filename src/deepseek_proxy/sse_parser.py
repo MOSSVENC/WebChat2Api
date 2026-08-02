@@ -112,10 +112,11 @@ def _fragment_to_frame(ty: str, content: str) -> Optional[DsFrame]:
 
 
 class DsState:
-    """DeepSeek Patch 状态机"""
+    """DeepSeek Patch 状态机 — 维护 p/o/v 路径操作状态"""
 
     def __init__(self):
         self.current_path: Optional[str] = None
+        self.fragments: list[dict] = []  # [{type, content}] — 跟踪 fragment 类型
         self.status: Optional[str] = None
         self.accumulated_token_usage: Optional[int] = None
 
@@ -173,7 +174,14 @@ class DsState:
         if isinstance(v, dict):
             resp = v.get("response", v)
             if isinstance(resp, dict):
-                for frag in resp.get("fragments", []):
+                # 记录 fragment 类型供后续 APPEND 判断
+                frags = resp.get("fragments", [])
+                if isinstance(frags, list):
+                    self.fragments = [
+                        {"type": f.get("type", ""), "content": f.get("content", "")}
+                        for f in frags if isinstance(f, dict)
+                    ]
+                for frag in frags if isinstance(frags, list) else []:
                     ty = frag.get("type", "")
                     content = frag.get("content", "")
                     f = _fragment_to_frame(ty, content)
@@ -218,15 +226,35 @@ class DsState:
             else:
                 text = str(v) if v else ""
 
-            if "/fragments/" in path:
-                frag_idx = self._extract_frag_idx(path)
-                ty = self._get_fragment_type(frag_idx)
-                if ty == FRAG_THINK:
-                    frames.append(DsFrame(type=DsFrameType.THINK_DELTA, value=text))
-                    return frames
-                elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
-                    frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
-                    return frames
+            # fragments/<idx>/content 路径: 按路径索引取 fragment 类型分流
+            if "/fragments/" in path and self.fragments:
+                idx = self._extract_frag_idx(path)
+                target = self._fragment_at(idx)
+                if target is not None:
+                    ty = target.get("type", "")
+                    # 累积到对应 fragment 内容
+                    target["content"] = target.get("content", "") + text
+                    if ty == FRAG_THINK:
+                        frames.append(DsFrame(type=DsFrameType.THINK_DELTA, value=text))
+                        return frames
+                    elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
+                        frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
+                        return frames
+
+            # fragments APPEND (新 fragment 加入)
+            if path == "response/fragments" and isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        ty = item.get("type", "")
+                        content = item.get("content", "")
+                        if not isinstance(content, str):
+                            content = ""
+                        self.fragments.append({"type": ty, "content": content})
+                        if content:
+                            f = _fragment_to_frame(ty, content)
+                            if f:
+                                frames.append(f)
+                return frames
 
             frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
             return frames
@@ -240,18 +268,28 @@ class DsState:
 
         return frames
 
-    def _extract_frag_idx(self, path: str) -> Optional[int]:
+
+
+    @staticmethod
+    def _extract_frag_idx(path: str) -> Optional[int]:
+        """从路径提取 fragment 索引: response/fragments/0/content → 0, -1 → -1"""
         parts = path.split("/")
         for i, p in enumerate(parts):
             if p == "fragments" and i + 1 < len(parts):
                 try:
                     return int(parts[i + 1])
                 except ValueError:
-                    pass
+                    return None
         return None
 
-    def _get_fragment_type(self, idx: Optional[int]) -> Optional[str]:
-        return None
+    def _fragment_at(self, idx: Optional[int]):
+        """按索引取 fragment，支持 -1 表示最后一个"""
+        if idx is None or not self.fragments:
+            return None
+        try:
+            return self.fragments[idx]
+        except IndexError:
+            return None
 
 
 async def parse_dsframe_stream(sse_stream: AsyncIterator[SseEvent]) -> AsyncIterator[DsFrame]:

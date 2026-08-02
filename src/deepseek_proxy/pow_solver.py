@@ -8,11 +8,10 @@ PoW 求解器 — 通过 wasmtime-py 执行 DeepSeekHashV1 WASM
 
 from __future__ import annotations
 
-import json
 import struct
 import logging
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Any
 
 import httpx
 

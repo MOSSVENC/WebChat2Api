@@ -9,8 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Optional, Any
 
-from .config import ProxyConfig, DeepSeekModel
-from .client import DsClient
+from .config import ProxyConfig
 from .prompt import build_chatml_prompt
 from .sessions import SessionStrategy
 from .jailbreak import get_jailbreak_prompt

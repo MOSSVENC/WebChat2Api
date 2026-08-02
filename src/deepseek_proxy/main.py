@@ -7,7 +7,6 @@ Usage:
     python main.py
 """
 
-import sys
 import logging
 import asyncio
 

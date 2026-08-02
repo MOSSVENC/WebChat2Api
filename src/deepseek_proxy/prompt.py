@@ -8,9 +8,8 @@ ChatML Prompt 构建 — 将 OpenAI messages 转换为 ChatML 格式字符串
 from __future__ import annotations
 
 import json
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any
 
-from .client import EditMessagePayload
 
 
 IM_START = "<|im_start|>"

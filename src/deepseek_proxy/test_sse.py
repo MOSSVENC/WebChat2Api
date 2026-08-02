@@ -112,8 +112,44 @@ async def main():
     await test_full_pipeline()
     print("---")
     await test_tool_calls()
+    await test_think_answer_split()
     print("\n\u2705 All tests passed!")
 
+
+# 模拟 V4-Pro 推理响应 (THINK/ANSWER 分流)
+MOCK_THINK = (
+    b'event: ready\ndata: {}\n\n'
+    b'data: {"v":{"response":{"thinking_enabled":true,"fragments":['
+    b'{"type":"THINK","content":"Let me reason about the sky."},'
+    b'{"type":"ANSWER","content":"The sky is blue."}]}}}\n\n'
+    b'data: {"p":"response/fragments/-1/content","o":"APPEND","v":" Rayleigh scattering."}\n\n'
+    b'data: {"p":"response/fragments/0/content","o":"APPEND","v":" Blue light scatters."}\n\n'
+    b'data: {"p":"response/status","o":"APPEND","v":"FINISHED"}\n\n'
+    b'event: finish\ndata: {}\n\n'
+)
+
+
+async def test_think_answer_split():
+    print("\n=== THINK/ANSWER 分流 ===")
+    async def byte_stream():
+        yield MOCK_THINK
+
+    reasoning = []
+    content = []
+    async for chunk in full_sse_pipeline(byte_stream(), model="deepseek-v4-pro"):
+        delta = chunk.get("choices", [{}])[0].get("delta", {})
+        if delta.get("reasoning_content"):
+            reasoning.append(delta["reasoning_content"])
+        if delta.get("content"):
+            content.append(delta["content"])
+
+    assert reasoning == ["Let me reason about the sky.", " Blue light scatters."], \
+        f"reasoning 分流错误: {reasoning}"
+    assert content == ["The sky is blue.", " Rayleigh scattering."], \
+        f"content 分流错误: {content}"
+    print(f"  reasoning: {reasoning}")
+    print(f"  content:   {content}")
+    print("  \u2713 推理内容进 reasoning_content, 正文进 content")
 
 if __name__ == "__main__":
     asyncio.run(main())
