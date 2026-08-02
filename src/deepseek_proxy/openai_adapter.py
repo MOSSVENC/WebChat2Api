@@ -6,6 +6,7 @@ OpenAI 兼容请求适配 — 接收 OpenAI 格式请求, 转换为 DeepSeek 调
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Any
 
 from .config import ProxyConfig, DeepSeekModel
@@ -13,6 +14,19 @@ from .client import DsClient
 from .prompt import build_chatml_prompt
 from .sessions import SessionStrategy
 from .jailbreak import get_jailbreak_prompt
+
+logger = logging.getLogger(__name__)
+
+# 已知模型别名 → (model_type, thinking, search)
+_KNOWN_MODELS: dict[str, tuple[str, bool, bool]] = {
+    "deepseek-v4-flash": ("default", False, False),
+    "deepseek-v3":       ("default", False, False),
+    "deepseek-v3.2":     ("default", False, False),
+    "default":           ("default", False, False),
+    "deepseek-v4-pro":   ("default", True,  True),
+    "deepseek-chat":     ("default", False, False),   # 即将弃用
+    "deepseek-reasoner": ("default", True,  False),   # 即将弃用
+}
 
 
 class OpenAIAdapter:
@@ -26,23 +40,20 @@ class OpenAIAdapter:
         """解析模型名 → (model_type, thinking_enabled, search_enabled)"""
         model_lower = model.lower()
 
-        # 精确匹配
-        if model_lower in ("deepseek-v4-flash", "deepseek-v3", "deepseek-v3.2", "default"):
-            return "default", False, False
-        if model_lower == "deepseek-v4-pro":
-            return "default", True, True
-        # deepseek-chat — 将于 2026/07/24 弃用，请迁移至 deepseek-v4-flash
-        if model_lower == "deepseek-chat":
-            return "default", False, False
-        # deepseek-reasoner — 将于 2026/07/24 弃用，实际等同于 deepseek-v4-flash 的思考模式
-        if model_lower == "deepseek-reasoner":
-            return "default", True, False
+        # 精确匹配已知模型
+        if model_lower in _KNOWN_MODELS:
+            return _KNOWN_MODELS[model_lower]
+
+        # 模糊匹配 (搜索类)
         if "search" in model_lower:
             return "default", False, True
-        if "think" in model_lower or "reasoner" in model_lower or "r1" in model_lower:
+
+        # 模糊匹配 (思考/推理类)
+        if any(kw in model_lower for kw in ("think", "reasoner", "r1", "o1", "o3")):
             return "default", True, False
 
-        # 默认
+        # 未知模型 — 日志警告，fallback 到 default
+        logger.warning("Unknown model '%s', falling back to default (deepseek-v4-flash)", model)
         return "default", False, False
 
     def build_prompt(
@@ -63,7 +74,6 @@ class OpenAIAdapter:
         """
         jailbreak_prompt = get_jailbreak_prompt(jailbreak)
         if jailbreak_prompt:
-            # 注入破限 system message 到最前面
             messages = [
                 {"role": "system", "content": jailbreak_prompt},
                 *messages,
@@ -88,19 +98,9 @@ class OpenAIAdapter:
         reasoning_effort: Optional[str] = None,
         jailbreak: Optional[str] = None,
     ):
-        """
-        执行一次对话请求。
-
-        Args:
-            jailbreak: 破限模板名称，None 或不传则不启用
-
-        Returns:
-            如果是 stream=True: httpx 流式响应 (可通过 full_sse_pipeline 解析)
-        """
-        # 解析模型参数
+        """执行一次对话请求"""
         model_type, default_thinking, default_search = self._resolve_model(model)
 
-        # 显式参数覆盖
         thinking_enabled = default_thinking
         search_enabled = default_search
 
@@ -109,7 +109,6 @@ class OpenAIAdapter:
         if web_search is not None:
             search_enabled = bool(web_search)
 
-        # 构建 prompt（含可选的破限注入）
         prompt = self.build_prompt(
             messages=messages,
             model=model,
@@ -121,7 +120,6 @@ class OpenAIAdapter:
             jailbreak=jailbreak,
         )
 
-        # 执行
         resp = await self.session.execute(
             prompt=prompt,
             thinking_enabled=thinking_enabled,

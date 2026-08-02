@@ -8,11 +8,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from .config import ProxyConfig, SessionMode
 from .client import DsClient, CompletionPayload, EditMessagePayload
 from .pow_solver import PowSolver
+
+logger = logging.getLogger(__name__)
 
 
 class SessionStrategy:
@@ -27,7 +30,6 @@ class SessionStrategy:
 
     async def prepare_pow(self, target_path: str = "/api/v0/chat/completion") -> str:
         """获取 PoW 挑战并求解, 返回 X-Ds-Pow-Response header 值"""
-        from .client import ChallengeData  # avoid circular at module level
         challenge = await self.client.create_pow_challenge(self.token, target_path)
         result = self.solver.solve(challenge)
         return result.to_header()
@@ -43,13 +45,15 @@ class SessionStrategy:
 class ReuseSessionStrategy(SessionStrategy):
     """ds-free-api 模式: 初始化时创建 session + health_check, 永久复用
 
-    会话绑定生命周期, 通过 edit_message 编辑 message 1。
+    会话绑定生命周期, 通过 edit_message 编辑后续消息。
+    message_id 由 health_check 完成后动态跟踪。
     """
 
     def __init__(self, config: ProxyConfig, client: DsClient, solver: PowSolver,
                  token: str, model_types: list[str]):
         super().__init__(config, client, solver, token)
-        self._sessions: dict[str, str] = {}  # model_type → session_id
+        self._sessions: dict[str, str] = {}       # model_type → session_id
+        self._message_ids: dict[str, int] = {}    # model_type → next message_id
 
     async def init(self, model_types: list[str]) -> None:
         for mt in model_types:
@@ -72,6 +76,9 @@ class ReuseSessionStrategy(SessionStrategy):
             pass
 
         self._sessions[model_type] = session_id
+        # health_check 占用 message 0, 下一次可用 message_id = 1
+        self._message_ids[model_type] = 1
+        logger.info("Session initialized: model_type=%s, session=%s", model_type, session_id)
 
     async def execute(self, prompt: str, thinking_enabled: bool = False,
                       search_enabled: bool = False, model_type: str = "default"):
@@ -79,10 +86,12 @@ class ReuseSessionStrategy(SessionStrategy):
         if not session_id:
             raise RuntimeError(f"No session for model_type={model_type}. Call init() first.")
 
+        msg_id = self._message_ids.get(model_type, 1)
+
         pow_header = await self.prepare_pow("/api/v0/chat/edit_message")
         payload = EditMessagePayload(
             chat_session_id=session_id,
-            message_id=1,  # message 0 是 health_check
+            message_id=msg_id,
             prompt=prompt,
             search_enabled=search_enabled,
             thinking_enabled=thinking_enabled,
@@ -93,12 +102,13 @@ class ReuseSessionStrategy(SessionStrategy):
         return resp
 
     async def cleanup(self) -> None:
-        for session_id in self._sessions.values():
+        for model_type, session_id in self._sessions.items():
             try:
                 await self.client.delete_session(self.token, session_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to delete session %s (model=%s): %s", session_id, model_type, e)
         self._sessions.clear()
+        self._message_ids.clear()
 
 
 class NewSessionStrategy(SessionStrategy):
@@ -126,8 +136,8 @@ class NewSessionStrategy(SessionStrategy):
 async def cleanup_session(client: DsClient, token: str, session_id: str) -> None:
     try:
         await client.delete_session(token, session_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to cleanup session %s: %s", session_id, e)
 
 
 def create_session_strategy(config: ProxyConfig, client: DsClient,

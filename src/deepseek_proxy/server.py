@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import ProxyConfig
 from .client import DsClient
-from .auth import create_auth_provider, AuthProvider
+from .auth import create_auth_provider, AuthProvider, TokenAuthProvider
 from .pow_solver import create_solver, PowSolver
 from .sessions import (
     create_session_strategy, SessionStrategy,
@@ -46,6 +46,7 @@ class AppState:
         self.token: Optional[str] = None
         self.session_strategy: Optional[SessionStrategy] = None
         self.adapter: Optional[OpenAIAdapter] = None
+        self._refresh_task: Optional[asyncio.Task] = None
 
     async def init(self):
         """初始化所有组件"""
@@ -77,10 +78,41 @@ class AppState:
         # 5. 适配器
         self.adapter = OpenAIAdapter(self.config, self.session_strategy)
 
+        # 6. 启动 token 定期刷新 (仅 TOKEN 模式)
+        if isinstance(self.auth, TokenAuthProvider):
+            self._refresh_task = asyncio.create_task(self._token_refresh_loop())
+            logger.info("Token 自动刷新已启动 (间隔 %ds)", self.config.token_refresh_interval)
+
         logger.info("DeepSeek Proxy 初始化完成")
+
+    async def _token_refresh_loop(self):
+        """定期验证 token 有效性，失败时尝试刷新"""
+        while True:
+            try:
+                await asyncio.sleep(self.config.token_refresh_interval)
+                if self.token is None:
+                    break
+                logger.debug("验证 token 有效性...")
+                new_token = await self.auth.refresh(self.token)  # type: ignore
+                if new_token and new_token != self.token:
+                    logger.info("Token 已刷新")
+                    self.token = new_token
+                elif new_token is None:
+                    logger.error("Token 刷新失败 — 后续请求可能失败")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Token 刷新循环异常: %s", e)
+                await asyncio.sleep(60)
 
     async def shutdown(self):
         """清理资源"""
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
         if self.session_strategy:
             await self.session_strategy.cleanup()
         if self.client:
@@ -101,12 +133,12 @@ def get_state() -> AppState:
 # ═══════════════════════════════════════════════════════════
 
 _MODEL_REGISTRY: list[dict] = [
-    # 新默认模型
     {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
-    # 思考模型
     {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+    # 向后兼容 (即将弃用)
+    {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
+    {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
 ]
-
 
 
 # ═══════════════════════════════════════════════════════════
@@ -119,7 +151,7 @@ def create_app(config: ProxyConfig) -> FastAPI:
     app = FastAPI(
         title="DeepSeek Proxy",
         description="OpenAI-compatible API proxy for DeepSeek chat",
-        version="0.1.0",
+        version="0.2.0",
     )
 
     # CORS
@@ -158,12 +190,10 @@ def create_app(config: ProxyConfig) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models():
-        """返回可用模型列表"""
         return {"object": "list", "data": list(_MODEL_REGISTRY)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        """OpenAI 兼容的聊天补全端点"""
         state = get_state()
 
         try:
@@ -221,12 +251,17 @@ def create_app(config: ProxyConfig) -> FastAPI:
 # ═══════════════════════════════════════════════════════════
 
 async def _handle_non_stream(resp, model: str) -> dict:
-    """非流式: 累积内容后返回"""
+    """非流式: 累积内容 + usage 后返回"""
     full_content = ""
-    async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model):
+    usage_data: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model, include_usage=True):
         delta = chunk.get("choices", [{}])[0].get("delta", {})
         if delta.get("content"):
             full_content += delta["content"]
+        # 提取 usage
+        if "usage" in chunk and chunk["usage"]:
+            usage_data = chunk["usage"]
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -237,7 +272,7 @@ async def _handle_non_stream(resp, model: str) -> dict:
             "message": {"role": "assistant", "content": full_content},
             "finish_reason": "stop",
         }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage_data,
     }
 
 
@@ -253,7 +288,6 @@ async def _event_stream(resp, model: str):
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
     finally:
-        # 清理 session (NEW 模式)
         session_id = getattr(resp, "_session_id", None)
         if session_id:
             state = get_state()

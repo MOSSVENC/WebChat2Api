@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import json
 import re
-import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, AsyncIterator, Any
 
@@ -24,8 +23,8 @@ from typing import Optional, AsyncIterator, Any
 
 MAX_BUF_SIZE = 4 * 1024 * 1024  # 4 MB，防止 OOM
 
-# 预编译正则：移除搜索关键词前缀
 _RE_SEARCH_PREFIX = re.compile(r'^(SEARCH|WEB_SEARCH|SEARCHING)\s*', re.IGNORECASE)
+_TOOL_CALLS_CLOSE = "</tool_calls>"
 
 
 @dataclass
@@ -35,11 +34,7 @@ class SseEvent:
 
 
 async def parse_sse_stream(byte_stream) -> AsyncIterator[SseEvent]:
-    """
-    Layer 1: 原始字节流 → SSE 事件.
-
-    以 \\n\\n 为事件分隔符，解析 event: 和 data: 字段。
-    """
+    """Layer 1: 原始字节流 → SSE 事件"""
     buf = bytearray()
 
     async for chunk in byte_stream:
@@ -58,7 +53,6 @@ async def parse_sse_stream(byte_stream) -> AsyncIterator[SseEvent]:
             if evt:
                 yield evt
 
-    # 末尾残留
     if buf.strip():
         evt = _parse_raw_event(bytes(buf).decode("utf-8", errors="replace"))
         if evt:
@@ -101,7 +95,7 @@ class DsFrameType(Enum):
 @dataclass
 class DsFrame:
     type: DsFrameType
-    value: Any = None  # str for THINK/CONTENT/STATUS, int for USAGE
+    value: Any = None
 
 
 FRAG_THINK = "THINK"
@@ -110,7 +104,6 @@ FRAG_ANSWER = "ANSWER"
 
 
 def _fragment_to_frame(ty: str, content: str) -> Optional[DsFrame]:
-    """将 fragment 类型映射为 DsFrame"""
     if ty == FRAG_THINK:
         return DsFrame(type=DsFrameType.THINK_DELTA, value=content)
     if ty in (FRAG_RESPONSE, FRAG_ANSWER):
@@ -119,24 +112,21 @@ def _fragment_to_frame(ty: str, content: str) -> Optional[DsFrame]:
 
 
 class DsState:
-    """DeepSeek Patch 状态机 — 维护 p/o/v 路径操作状态"""
+    """DeepSeek Patch 状态机"""
 
     def __init__(self):
         self.current_path: Optional[str] = None
-        self.fragments: list[dict] = []  # [{type, content}]
         self.status: Optional[str] = None
         self.accumulated_token_usage: Optional[int] = None
 
     def apply_event(self, evt: SseEvent) -> list[DsFrame]:
         frames: list[DsFrame] = []
 
-        # 事件类型
         if evt.event == "ready":
             frames.append(DsFrame(type=DsFrameType.ROLE))
         elif evt.event == "finish":
             frames.append(DsFrame(type=DsFrameType.FINISH))
 
-        # 解析 data
         if evt.data and evt.data.strip():
             try:
                 val = json.loads(evt.data)
@@ -173,96 +163,99 @@ class DsState:
                 frames.extend(self._apply_path(path, op, v))
 
         elif self.current_path:
-            # 继承 current_path 的纯 v 增量, 隐含 APPEND
             frames.extend(self._apply_path(self.current_path, "APPEND", v))
-
         else:
-            # 初始 snapshot: 无 current_path
             self._apply_snapshot(v, frames)
 
         return frames
 
     def _apply_snapshot(self, v: Any, frames: list[DsFrame]) -> None:
-        """处理初始快照: {v: {response: {thinking_enabled, fragments: [...]}}}"""
-        if not isinstance(v, dict):
-            return
-
-        response = v.get("response")
-        if not isinstance(response, dict):
-            return
-
-        fragments = response.get("fragments")
-        if not isinstance(fragments, list):
-            return
-
-        self.fragments = []
-        for frag in fragments:
-            if not isinstance(frag, dict):
-                continue
-            ty = frag.get("type", "")
-            content = frag.get("content", "")
-            if not isinstance(content, str):
-                content = ""
-
-            self.fragments.append({"type": ty, "content": content})
-
-            if content:
-                frame = _fragment_to_frame(ty, content)
-                if frame:
-                    frames.append(frame)
+        if isinstance(v, dict):
+            resp = v.get("response", v)
+            if isinstance(resp, dict):
+                for frag in resp.get("fragments", []):
+                    ty = frag.get("type", "")
+                    content = frag.get("content", "")
+                    f = _fragment_to_frame(ty, content)
+                    if f:
+                        frames.append(f)
+                status = resp.get("status")
+                if status:
+                    self.status = status
+                    if status == "FINISHED":
+                        frames.append(DsFrame(type=DsFrameType.STATUS, value="FINISHED"))
+                usage = resp.get("usage")
+                if usage and isinstance(usage, dict):
+                    tu = usage.get("total_token_usage")
+                    if tu is not None:
+                        self.accumulated_token_usage = tu
+                        frames.append(DsFrame(type=DsFrameType.USAGE, value=tu))
+            elif isinstance(resp, str):
+                frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=resp))
+        elif isinstance(v, str):
+            frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=v))
 
     def _apply_path(self, path: str, op: Optional[str], v: Any) -> list[DsFrame]:
         frames: list[DsFrame] = []
 
-        if path in ("response/status",):
-            if isinstance(v, str):
-                self.status = v
-                frames.append(DsFrame(type=DsFrameType.STATUS, value=v))
-
-        elif path in ("response/accumulated_token_usage", "accumulated_token_usage"):
+        if "usage" in path and "total_token_usage" in path:
             if isinstance(v, (int, float)):
-                u = int(v)
-                self.accumulated_token_usage = u
-                frames.append(DsFrame(type=DsFrameType.USAGE, value=u))
+                self.accumulated_token_usage = int(v)
+                frames.append(DsFrame(type=DsFrameType.USAGE, value=int(v)))
+            return frames
 
-        elif path in ("response/search_status", "response/search_results"):
-            pass  # 忽略搜索相关
+        if path.endswith("/status"):
+            status_val = v if isinstance(v, str) else str(v)
+            self.status = status_val
+            frames.append(DsFrame(type=DsFrameType.STATUS, value=status_val))
+            return frames
 
-        elif path == "response/fragments/-1/content":
-            if isinstance(v, str) and self.fragments:
-                last = self.fragments[-1]
-                ty = last.get("type", "")
-                last["content"] += v
-                frame = _fragment_to_frame(ty, v)
-                if frame:
-                    frames.append(frame)
+        if "/content" in path:
+            if isinstance(v, str):
+                text = v
+            elif isinstance(v, dict) and "value" in v:
+                text = v["value"]
+            else:
+                text = str(v) if v else ""
 
-        elif path == "response/fragments/-1/elapsed_secs":
-            pass  # 忽略耗时
+            if "/fragments/" in path:
+                frag_idx = self._extract_frag_idx(path)
+                ty = self._get_fragment_type(frag_idx)
+                if ty == FRAG_THINK:
+                    frames.append(DsFrame(type=DsFrameType.THINK_DELTA, value=text))
+                    return frames
+                elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
+                    frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
+                    return frames
 
-        elif path == "response/fragments" and op == "APPEND":
-            if isinstance(v, list):
-                for item in v:
-                    if isinstance(item, dict):
-                        ty = item.get("type", "")
-                        content = item.get("content", "")
-                        if not isinstance(content, str):
-                            content = ""
-                        self.fragments.append({"type": ty, "content": content})
-                        if content:
-                            frame = _fragment_to_frame(ty, content)
-                            if frame:
-                                frames.append(frame)
+            frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
+            return frames
+
+        if isinstance(v, str):
+            frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=v))
+        elif isinstance(v, dict):
+            content = v.get("content", "")
+            if content:
+                frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=str(content)))
 
         return frames
 
+    def _extract_frag_idx(self, path: str) -> Optional[int]:
+        parts = path.split("/")
+        for i, p in enumerate(parts):
+            if p == "fragments" and i + 1 < len(parts):
+                try:
+                    return int(parts[i + 1])
+                except ValueError:
+                    pass
+        return None
 
-async def parse_dsframe_stream(sse_stream) -> AsyncIterator[DsFrame]:
-    """
-    Layer 2: SSE 事件流 → DsFrame 增量帧.
+    def _get_fragment_type(self, idx: Optional[int]) -> Optional[str]:
+        return None
 
-    应用 patch 状态机, 将 p/o/v 操作转为语义化帧。
-    """
+
+async def parse_dsframe_stream(sse_stream: AsyncIterator[SseEvent]) -> AsyncIterator[DsFrame]:
+    """Layer 2: SSE 事件流 → DsFrame 流"""
     state = DsState()
 
     async for evt in sse_stream:
@@ -272,7 +265,7 @@ async def parse_dsframe_stream(sse_stream) -> AsyncIterator[DsFrame]:
 
 
 # ═══════════════════════════════════════════════════════════
-# Layer 3: OpenAI Chunk
+# Layer 3: DsFrame → OpenAI Chunk
 # ═══════════════════════════════════════════════════════════
 
 @dataclass
@@ -280,128 +273,126 @@ class Delta:
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
-    tool_calls: Optional[list[dict]] = None
+    tool_calls: Optional[list] = None
 
 
-@dataclass
-class ChunkChoice:
-    index: int = 0
-    delta: Delta = field(default_factory=Delta)
-    finish_reason: Optional[str] = None
+def make_chunk(delta: Delta, model: str = "deepseek-chat",
+               finish_reason: Optional[str] = None) -> dict:
+    d: dict = {}
+    if delta.role is not None:
+        d["role"] = delta.role
+    if delta.content is not None:
+        d["content"] = delta.content
+    if delta.reasoning_content is not None:
+        d["reasoning_content"] = delta.reasoning_content
+    if delta.tool_calls is not None:
+        d["tool_calls"] = delta.tool_calls
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": d,
+            "finish_reason": finish_reason,
+        }],
+    }
+
+
+def make_usage_chunk(prompt_tokens: int, completion_tokens: int) -> dict:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+        "object": "chat.completion.chunk",
+        "model": "",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
 
 
 async def convert_to_openai_chunks(
-    ds_frame_stream,
+    ds_frame_stream: AsyncIterator[DsFrame],
     model: str = "deepseek-chat",
     include_usage: bool = False,
     prompt_tokens: int = 0,
 ) -> AsyncIterator[dict]:
-    """
-    Layer 3: DsFrame 增量帧 → OpenAI ChatCompletionChunk (dict).
+    """Layer 3: DsFrame → OpenAI ChatCompletionChunk"""
 
-    输出标准 OpenAI 流式响应格式:
-    {"id": "...", "object": "chat.completion.chunk", "choices": [...], ...}
-    """
-    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-    created = int(time.time())
     finished = False
     usage_sent = False
     usage_value: Optional[int] = None
 
-    # 工具调用解析状态 (简化: 从 content 中提取 <tool_calls> XML)
-    tool_buffer: str = ""
+    # Tool Call 缓冲
     tool_calls_active = False
-
-    def make_chunk(delta: Delta, finish_reason: Optional[str] = None) -> dict:
-        c = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish_reason,
-            }],
-        }
-        if delta.role:
-            c["choices"][0]["delta"]["role"] = delta.role
-        if delta.content is not None:
-            c["choices"][0]["delta"]["content"] = delta.content
-        if delta.reasoning_content is not None:
-            c["choices"][0]["delta"]["reasoning_content"] = delta.reasoning_content
-        if delta.tool_calls:
-            c["choices"][0]["delta"]["tool_calls"] = delta.tool_calls
-        return c
-
-    def make_usage_chunk(prompt: int, completion: int) -> dict:
-        return {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [],
-            "usage": {
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "total_tokens": prompt + completion,
-            },
-        }
+    tool_buffer = ""
 
     try:
         async for frame in ds_frame_stream:
             if frame.type == DsFrameType.ROLE:
-                yield make_chunk(Delta(role="assistant"))
+                yield make_chunk(Delta(role="assistant"), model=model)
 
             elif frame.type == DsFrameType.THINK_DELTA:
                 text = _clean_text(frame.value)
                 if text:
-                    yield make_chunk(Delta(reasoning_content=text))
+                    yield make_chunk(Delta(reasoning_content=text), model=model)
 
             elif frame.type == DsFrameType.CONTENT_DELTA:
                 text = _clean_text(frame.value)
                 if not text:
                     continue
 
-                # 检测工具调用开始
-                if not tool_calls_active and "<tool_calls>" in text:
-                    tool_calls_active = True
-                    before, after = text.split("<tool_calls>", 1)
-                    if before.strip():
-                        yield make_chunk(Delta(content=before))
-                    tool_buffer = after
-                    continue
-
+                # ── Tool Call: 累积缓冲，检测 </tool_calls> 闭合标签 ──
                 if tool_calls_active:
                     tool_buffer += text
-
-                    # 检测工具调用结束
-                    if "</tool_calls>" in tool_buffer:
+                    close_idx = tool_buffer.find(_TOOL_CALLS_CLOSE)
+                    if close_idx >= 0:
                         tool_calls_active = False
-                        parsed = _parse_tool_calls_buffer(tool_buffer)
+                        tc_json = tool_buffer[:close_idx].strip()
+                        parsed = _parse_tool_calls_json(tc_json)
                         if parsed:
-                            tc_deltas = []
-                            for i, tc in enumerate(parsed):
-                                tc_deltas.append({
-                                    "index": i,
-                                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.get("name", ""),
-                                        "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
-                                    },
-                                })
-                            yield make_chunk(Delta(tool_calls=tc_deltas))
+                            tc_deltas = _build_tool_call_deltas(parsed)
+                            yield make_chunk(Delta(tool_calls=tc_deltas), model=model)
+                        after = tool_buffer[close_idx + len(_TOOL_CALLS_CLOSE):]
                         tool_buffer = ""
+                        if after.strip():
+                            yield make_chunk(Delta(content=after), model=model)
                     continue
 
-                yield make_chunk(Delta(content=text))
+                # 检测 <tool_calls> 开始标签
+                open_idx = text.find("<tool_calls>")
+                if open_idx >= 0:
+                    tool_calls_active = True
+                    before = text[:open_idx]
+                    after_tag = text[open_idx + len("<tool_calls>"):]
+                    if before.strip():
+                        yield make_chunk(Delta(content=before), model=model)
+                    tool_buffer = after_tag
+                    # 检查是否同一 chunk 内就闭合
+                    close_idx = tool_buffer.find(_TOOL_CALLS_CLOSE)
+                    if close_idx >= 0:
+                        tool_calls_active = False
+                        tc_json = tool_buffer[:close_idx].strip()
+                        parsed = _parse_tool_calls_json(tc_json)
+                        if parsed:
+                            tc_deltas = _build_tool_call_deltas(parsed)
+                            yield make_chunk(Delta(tool_calls=tc_deltas), model=model)
+                        after = tool_buffer[close_idx + len(_TOOL_CALLS_CLOSE):]
+                        tool_buffer = ""
+                        if after.strip():
+                            yield make_chunk(Delta(content=after), model=model)
+                    continue
+
+                yield make_chunk(Delta(content=text), model=model)
 
             elif frame.type == DsFrameType.STATUS:
                 status = str(frame.value) if frame.value else ""
                 if status == "FINISHED" and not finished:
                     finished = True
-                    yield make_chunk(Delta(), finish_reason="stop")
+                    yield make_chunk(Delta(), model=model, finish_reason="stop")
 
             elif frame.type == DsFrameType.USAGE:
                 usage_value = int(frame.value) if frame.value else 0
@@ -412,10 +403,9 @@ async def convert_to_openai_chunks(
             elif frame.type == DsFrameType.FINISH:
                 if not finished:
                     finished = True
-                    yield make_chunk(Delta(), finish_reason="stop")
+                    yield make_chunk(Delta(), model=model, finish_reason="stop")
 
     finally:
-        # 确保结束时发送 usage (如果循环内没发过)
         if finished and include_usage and not usage_sent and usage_value is not None:
             yield make_usage_chunk(prompt_tokens, usage_value)
 
@@ -423,16 +413,13 @@ async def convert_to_openai_chunks(
 def _clean_text(text: Any) -> str:
     if not isinstance(text, str):
         text = str(text)
-    # 移除 FINISHED 标记
     text = text.replace("FINISHED", "")
-    # 移除搜索关键词前缀
     text = _RE_SEARCH_PREFIX.sub('', text)
     return text
 
 
-def _parse_tool_calls_buffer(buf: str) -> list[dict]:
-    """从 tool_buffer 中提取工具调用 JSON 数组"""
-    buf = buf.replace("</tool_calls>", "")
+def _parse_tool_calls_json(buf: str) -> list[dict]:
+    """从 tool_calls 内容中解析 JSON"""
     buf = buf.strip()
     try:
         parsed = json.loads(buf)
@@ -441,8 +428,31 @@ def _parse_tool_calls_buffer(buf: str) -> list[dict]:
         if isinstance(parsed, dict):
             return [parsed]
     except json.JSONDecodeError:
-        pass
+        try:
+            fixed = buf.replace("'", '"')
+            parsed = json.loads(fixed)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                return [parsed]
+        except json.JSONDecodeError:
+            pass
     return []
+
+
+def _build_tool_call_deltas(parsed: list[dict]) -> list[dict]:
+    tc_deltas = []
+    for i, tc in enumerate(parsed):
+        tc_deltas.append({
+            "index": i,
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": tc.get("name", ""),
+                "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
+            },
+        })
+    return tc_deltas
 
 
 # ═══════════════════════════════════════════════════════════
@@ -455,13 +465,7 @@ async def full_sse_pipeline(
     include_usage: bool = False,
     prompt_tokens: int = 0,
 ) -> AsyncIterator[dict]:
-    """
-    完整 SSE Pipeline: 字节流 → OpenAI Chunks.
-
-    Layer 1: bytes → SseEvent
-    Layer 2: SseEvent → DsFrame (patch 状态机)
-    Layer 3: DsFrame → OpenAI Chunk
-    """
+    """完整 SSE Pipeline: 字节流 → OpenAI Chunks"""
     sse_stream = parse_sse_stream(byte_stream)
     ds_frame_stream = parse_dsframe_stream(sse_stream)
 

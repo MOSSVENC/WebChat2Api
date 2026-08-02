@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
 from .config import ProxyConfig, AuthMode
 from .client import DsClient, LoginPayload, LoginData, ClientError
+
+logger = logging.getLogger(__name__)
 
 
 class AuthProvider(ABC):
@@ -60,11 +63,14 @@ class PasswordAuthProvider(AuthProvider):
         for attempt in range(1, 4):
             try:
                 self._login_data = await self.client.login(payload)
+                logger.info("Password login succeeded (attempt %d)", attempt)
                 return self._login_data.user.token
             except ClientError as e:
                 last_error = e
                 if attempt < 3:
-                    await asyncio.sleep(2)
+                    wait = min(2 ** attempt, 10)  # 指数退避: 2s, 4s, capped 10s
+                    logger.warning("Login attempt %d failed: %s, retry in %ds", attempt, e, wait)
+                    await asyncio.sleep(wait)
 
         raise last_error or ClientError("login failed after 3 attempts")
 
