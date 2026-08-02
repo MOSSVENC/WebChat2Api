@@ -135,9 +135,6 @@ def get_state() -> AppState:
 _MODEL_REGISTRY: list[dict] = [
     {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
     {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
-    # 向后兼容 (即将弃用)
-    {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
-    {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
 ]
 
 

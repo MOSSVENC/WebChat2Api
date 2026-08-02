@@ -199,8 +199,6 @@ response = client.chat.completions.create(
 |-----------|---------|------|------|
 | `deepseek-v4-flash` | DeepSeek-V4-Flash | 快速对话（默认） | **推荐** |
 | `deepseek-v4-pro` | DeepSeek-V4-Pro | 深度推理（默认思考） | **推荐** |
-| `deepseek-chat` | DeepSeek-V4-Flash | 快速对话 | ⚠️ 将于 2026/07/24 弃用 |
-| `deepseek-reasoner` | DeepSeek-V4-Pro | 思考模式 | ⚠️ 将于 2026/07/24 弃用 |
 
 ---
 

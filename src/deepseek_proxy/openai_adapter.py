@@ -24,8 +24,6 @@ _KNOWN_MODELS: dict[str, tuple[str, bool, bool]] = {
     "deepseek-v3.2":     ("default", False, False),
     "default":           ("default", False, False),
     "deepseek-v4-pro":   ("default", True,  True),
-    "deepseek-chat":     ("default", False, False),   # 即将弃用
-    "deepseek-reasoner": ("default", True,  False),   # 即将弃用
 }
 
 
